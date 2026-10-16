@@ -1,0 +1,520 @@
+import AVFoundation
+import AppKit
+import CoreMediaIO
+
+// USBMirror: Automatic wired iPhone capture, dedicated OBS window, and audio controls.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var controlWindow: NSWindow!
+    private var outputWindow: NSWindow!
+    private var statusLabel: NSTextField!
+    private var previewLayer: AVCaptureVideoPreviewLayer!
+    private var volumeSlider: NSSlider!
+    private var volumeValueLabel: NSTextField!
+    private var muteButton: NSButton!
+
+    // Keep the same session for both iPhone screen video and internal audio.
+    private let captureSession = AVCaptureSession()
+    private let audioPreview = AVCaptureAudioPreviewOutput()
+    private let savedVolumeKey = "USBMirror.savedVolume"
+    private var isAudioMuted = false
+    private var videoAccessAllowed = false
+    private var isStartingCapture = false
+    private var activeCaptureDeviceID: String?
+    private var monitoringTimer: Timer?
+    private var lastStatusMessage = ""
+    private var statusItem: NSStatusItem?
+    private var menuMuteItem: NSMenuItem?
+    private var statusMuteItem: NSMenuItem?
+    private enum ScreenShape { case portrait, landscape }
+    private var currentShape: ScreenShape?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        createWindows()
+        configureMenus()
+        enableIPhoneCaptureDevices()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(captureDeviceDisconnected(_:)),
+            name: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil
+        )
+
+        // Ask only once, on launch. Then USBMirror starts when the phone is found.
+        Task { @MainActor in
+            let allowed = await AVCaptureDevice.requestAccess(for: .video)
+            videoAccessAllowed = allowed
+            if allowed {
+                setStatus("Connect and unlock your iPhone via USB")
+                checkDeviceAndCapture()
+            } else {
+                setStatus("Allow Camera access in System Settings")
+            }
+        }
+
+        monitoringTimer = Timer.scheduledTimer(
+            timeInterval: 2.0,
+            target: self,
+            selector: #selector(monitorTick(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+    }
+
+    private func createWindows() {
+        // Window 1: controls only (NOT the one OBS captures).
+        controlWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 510, height: 235),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        controlWindow.title = "USBMirror — Controls"
+        controlWindow.center()
+        controlWindow.appearance = NSAppearance(named: .darkAqua)
+        controlWindow.isReleasedWhenClosed = false
+        controlWindow.delegate = self
+
+        let controls = NSView()
+        controls.wantsLayer = true
+        controls.layer?.backgroundColor =
+            NSColor(
+                calibratedRed: 0.07, green: 0.08, blue: 0.10, alpha: 1.0
+            ).cgColor
+        controlWindow.contentView = controls
+
+        let title = NSTextField(labelWithString: "USBMirror")
+        title.font = .boldSystemFont(ofSize: 23)
+        title.textColor = .white
+
+        statusLabel = NSTextField(labelWithString: "Checking camera permission...")
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .systemGray
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+
+        let audioLabel = NSTextField(labelWithString: "iPhone audio")
+        audioLabel.font = .boldSystemFont(ofSize: 13)
+        audioLabel.textColor = .white
+
+        let savedVolume =
+            UserDefaults.standard.object(forKey: savedVolumeKey) == nil
+            ? 1.0
+            : min(1.0, max(0.0, UserDefaults.standard.double(forKey: savedVolumeKey)))
+
+        volumeSlider = NSSlider(
+            value: savedVolume,
+            minValue: 0.0,
+            maxValue: 1.0,
+            target: self,
+            action: #selector(volumeChanged(_:))
+        )
+        volumeSlider.isContinuous = true
+
+        volumeValueLabel = NSTextField(
+            labelWithString: "\(Int((savedVolume * 100).rounded()))%"
+        )
+        volumeValueLabel.font = .systemFont(ofSize: 12)
+        volumeValueLabel.textColor = .systemGray
+        volumeValueLabel.alignment = .right
+
+        muteButton = NSButton(
+            title: "Mute Audio",
+            target: self,
+            action: #selector(toggleAudioMute(_:))
+        )
+        muteButton.bezelStyle = .rounded
+
+        let outputButton = NSButton(
+            title: "Show Output Window",
+            target: self,
+            action: #selector(showOutputWindow)
+        )
+        outputButton.bezelStyle = .rounded
+
+        for view in [
+            title, statusLabel, audioLabel, volumeSlider,
+            volumeValueLabel, muteButton, outputButton,
+        ] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            controls.addSubview(view)
+        }
+
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: controls.leadingAnchor, constant: 22),
+            title.topAnchor.constraint(equalTo: controls.topAnchor, constant: 20),
+            statusLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            statusLabel.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10),
+            statusLabel.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -22),
+
+            audioLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            audioLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 28),
+            volumeSlider.leadingAnchor.constraint(equalTo: audioLabel.trailingAnchor, constant: 14),
+            volumeSlider.centerYAnchor.constraint(equalTo: audioLabel.centerYAnchor),
+            volumeSlider.trailingAnchor.constraint(
+                equalTo: volumeValueLabel.leadingAnchor, constant: -8),
+            volumeValueLabel.centerYAnchor.constraint(equalTo: audioLabel.centerYAnchor),
+            volumeValueLabel.trailingAnchor.constraint(
+                equalTo: controls.trailingAnchor, constant: -22),
+            volumeValueLabel.widthAnchor.constraint(equalToConstant: 48),
+
+            muteButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            muteButton.topAnchor.constraint(equalTo: audioLabel.bottomAnchor, constant: 21),
+            muteButton.heightAnchor.constraint(equalToConstant: 32),
+            outputButton.trailingAnchor.constraint(equalTo: controls.trailingAnchor, constant: -22),
+            outputButton.centerYAnchor.constraint(equalTo: muteButton.centerYAnchor),
+            outputButton.heightAnchor.constraint(equalToConstant: 32),
+        ])
+
+        // Window 2: video only. Pick this exact window in OBS Window Capture.
+        outputWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        outputWindow.title = "USBMirror — OBS Output"
+        outputWindow.center()
+        outputWindow.minSize = NSSize(width: 220, height: 220)
+        outputWindow.collectionBehavior.insert(.fullScreenPrimary)
+        outputWindow.backgroundColor = .black
+        outputWindow.isReleasedWhenClosed = false
+
+        let videoView = NSView()
+        videoView.wantsLayer = true
+        videoView.layer?.backgroundColor = NSColor.black.cgColor
+        outputWindow.contentView = videoView
+
+        previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+        previewLayer.videoGravity = .resizeAspectFill  // Never stretch or crop the phone picture.
+        videoView.layer?.addSublayer(previewLayer)
+        previewLayer.frame = videoView.bounds
+        previewLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+
+        controlWindow.makeKeyAndOrderFront(nil)
+        outputWindow.orderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func enableIPhoneCaptureDevices() {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+        )
+        var enabled: UInt32 = 1
+        let result = CMIOObjectSetPropertyData(
+            CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil,
+            UInt32(MemoryLayout<UInt32>.size), &enabled
+        )
+        print(result == noErr ? "USB capture devices enabled." : "CMIO setup error: \(result)")
+    }
+
+    private func setStatus(_ message: String) {
+        guard message != lastStatusMessage else { return }
+        lastStatusMessage = message
+        statusLabel.stringValue = message
+        print("USBMirror:", message)
+    }
+
+    private func findIPhoneScreenDevice() -> AVCaptureDevice? {
+        let devices = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.externalUnknown],
+            mediaType: nil,
+            position: .unspecified
+        ).devices
+        return devices.first(where: {
+            $0.modelID == "iOS Device" && $0.hasMediaType(.muxed)
+        })
+            ?? devices.first(where: {
+                ($0.localizedName.localizedCaseInsensitiveContains("iPhone")
+                    || $0.localizedName.localizedCaseInsensitiveContains("iPad"))
+                    && $0.hasMediaType(.muxed)
+            })
+    }
+
+    @objc private func monitorTick(_ timer: Timer) {
+        checkDeviceAndCapture()
+        adjustOutputForOrientation()
+    }
+
+    private func checkDeviceAndCapture() {
+        guard videoAccessAllowed, !isStartingCapture else { return }
+
+        // Checking while running also catches systems that don't send a disconnect notification.
+        let device = findIPhoneScreenDevice()
+        if captureSession.isRunning {
+            if device?.uniqueID != activeCaptureDeviceID {
+                print("Active screen capture device disappeared.")
+                stopCaptureForDisconnection()
+            }
+            return
+        }
+
+        guard let device else {
+            setStatus("Connect and unlock your iPhone via USB")
+            return
+        }
+        startCapture(using: device)
+    }
+
+    private func startCapture(using iphone: AVCaptureDevice) {
+        guard !isStartingCapture, !captureSession.isRunning else { return }
+        isStartingCapture = true
+        defer { isStartingCapture = false }
+
+        setStatus("Connecting: \(iphone.localizedName)...")
+        do {
+            let input = try AVCaptureDeviceInput(device: iphone)
+            captureSession.beginConfiguration()
+            for old in captureSession.inputs { captureSession.removeInput(old) }
+            guard captureSession.canAddInput(input) else {
+                captureSession.commitConfiguration()
+                setStatus("Cannot use iPhone capture input")
+                return
+            }
+            captureSession.addInput(input)
+            print("iPhone input ports:", input.ports.map { $0.mediaType.rawValue })
+
+            if !captureSession.outputs.contains(audioPreview) {
+                if captureSession.canAddOutput(audioPreview) {
+                    captureSession.addOutput(audioPreview)
+                    print("Audio preview output added.")
+                } else {
+                    print("Audio preview output unavailable.")
+                }
+            }
+            audioPreview.volume = isAudioMuted ? 0 : Float(volumeSlider.doubleValue)
+            captureSession.commitConfiguration()
+
+            // Preserve the existing working prototype's capture-session behavior.
+            captureSession.startRunning()
+            if captureSession.isRunning {
+                activeCaptureDeviceID = iphone.uniqueID
+                currentShape = nil  // Re-detect shape for each fresh connection.
+                setStatus("Mirroring: \(iphone.localizedName)")
+                outputWindow.orderFront(nil)
+                print(
+                    "Capture running; audio connection:",
+                    audioPreview.connection(with: .audio) != nil)
+            } else {
+                setStatus("Unable to start iPhone capture")
+            }
+        } catch {
+            setStatus("Capture error: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopCaptureForDisconnection() {
+        if captureSession.isRunning { captureSession.stopRunning() }
+        activeCaptureDeviceID = nil
+        currentShape = nil
+        setStatus("iPhone disconnected — waiting to reconnect")
+    }
+
+    @objc private func captureDeviceDisconnected(_ notification: Notification) {
+        guard let device = notification.object as? AVCaptureDevice,
+            device.uniqueID == activeCaptureDeviceID
+        else { return }
+        print("iPhone disconnected:", device.localizedName)
+        stopCaptureForDisconnection()
+    }
+
+    // The preview layer reports its displayed video's rect. This lets us detect
+    // changes between tall (portrait) and wide (landscape) content without adding
+    // a second video output to the capture session.
+    private func adjustOutputForOrientation() {
+        guard captureSession.isRunning, !outputWindow.styleMask.contains(.fullScreen) else {
+            return
+        }
+        let rect = previewLayer.layerRectConverted(
+            fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)
+        )
+        guard rect.width > 20, rect.height > 20 else { return }
+
+        let ratio = rect.width / rect.height
+        let shape: ScreenShape
+        if ratio > 1.15 {
+            shape = .landscape
+        } else if ratio < 0.87 {
+            shape = .portrait
+        } else {
+            return  // Ignore transient or approximately square frames.
+        }
+        guard currentShape != shape else { return }
+        currentShape = shape
+
+        // Resize the output WINDOW, keeping some room for the title bar.
+        let targetContent =
+            shape == .portrait
+            ? NSSize(width: 390, height: 690)
+            : NSSize(width: 850, height: 480)
+        let frame = outputWindow.frameRect(
+            forContentRect: NSRect(origin: .zero, size: targetContent))
+        let oldFrame = outputWindow.frame
+        var newFrame = NSRect(
+            x: oldFrame.midX - frame.width / 2,
+            y: oldFrame.midY - frame.height / 2,
+            width: frame.width,
+            height: frame.height
+        )
+        if let screen = outputWindow.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            newFrame.size.width = min(newFrame.width, visible.width)
+            newFrame.size.height = min(newFrame.height, visible.height)
+            newFrame.origin.x = max(visible.minX, min(newFrame.minX, visible.maxX - newFrame.width))
+            newFrame.origin.y = max(
+                visible.minY, min(newFrame.minY, visible.maxY - newFrame.height))
+        }
+        outputWindow.setFrame(newFrame, display: true, animate: true)
+        print("OBS output orientation:", shape == .portrait ? "portrait" : "landscape")
+    }
+
+    @objc private func toggleAudioMute(_ sender: NSButton) {
+        isAudioMuted.toggle()
+        audioPreview.volume = isAudioMuted ? 0 : Float(volumeSlider.doubleValue)
+        updateMuteLabels()
+    }
+
+    @objc private func volumeChanged(_ sender: NSSlider) {
+        isAudioMuted = false
+        updateMuteLabels()
+        audioPreview.volume = Float(sender.doubleValue)
+        UserDefaults.standard.set(sender.doubleValue, forKey: savedVolumeKey)
+        volumeValueLabel.stringValue = "\(Int((sender.doubleValue * 100).rounded()))%"
+    }
+
+    @objc private func showOutputWindow() {
+        outputWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showControlWindow() {
+        controlWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func toggleOutputFullScreen() {
+        showOutputWindow()
+        outputWindow.toggleFullScreen(nil)
+    }
+
+    @objc private func toggleAudioFromMenu() {
+        isAudioMuted.toggle()
+        audioPreview.volume = isAudioMuted ? 0 : Float(volumeSlider.doubleValue)
+        updateMuteLabels()
+    }
+
+    private func updateMuteLabels() {
+        let title = isAudioMuted ? "Unmute Audio" : "Mute Audio"
+        muteButton.title = title
+        menuMuteItem?.title = title
+        statusMuteItem?.title = title
+    }
+
+    @objc private func openAbout() {
+        NSApp.orderFrontStandardAboutPanel(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func quitUSBMirror() {
+        NSApp.terminate(nil)
+    }
+
+    // Native Mac menus and a compact icon in the system menu bar.
+    // Both give users access to the two windows without changing the capture pipeline.
+    private func configureMenus() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "USBMirror")
+
+        let about = NSMenuItem(
+            title: "About USBMirror", action: #selector(openAbout), keyEquivalent: "")
+        about.target = self
+        appMenu.addItem(about)
+        appMenu.addItem(.separator())
+        let quit = NSMenuItem(
+            title: "Quit USBMirror", action: #selector(quitUSBMirror), keyEquivalent: "q")
+        quit.target = self
+        appMenu.addItem(quit)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let windowsMenuItem = NSMenuItem()
+        let windowsMenu = NSMenu(title: "Windows")
+        let showControls = NSMenuItem(
+            title: "Show Controls", action: #selector(showControlWindow), keyEquivalent: "1")
+        showControls.target = self
+        windowsMenu.addItem(showControls)
+        let showOutput = NSMenuItem(
+            title: "Show OBS Output", action: #selector(showOutputWindow), keyEquivalent: "2")
+        showOutput.target = self
+        windowsMenu.addItem(showOutput)
+        let fullScreen = NSMenuItem(
+            title: "Toggle Output Full Screen", action: #selector(toggleOutputFullScreen),
+            keyEquivalent: "f")
+        fullScreen.target = self
+        windowsMenu.addItem(fullScreen)
+        windowsMenuItem.submenu = windowsMenu
+        mainMenu.addItem(windowsMenuItem)
+
+        let audioMenuItem = NSMenuItem()
+        let audioMenu = NSMenu(title: "Audio")
+        let mute = NSMenuItem(
+            title: "Mute Audio", action: #selector(toggleAudioFromMenu), keyEquivalent: "m")
+        mute.target = self
+        audioMenu.addItem(mute)
+        menuMuteItem = mute
+        audioMenuItem.submenu = audioMenu
+        mainMenu.addItem(audioMenuItem)
+        NSApp.mainMenu = mainMenu
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(
+            systemSymbolName: "iphone", accessibilityDescription: "USBMirror")
+        if item.button?.image == nil { item.button?.title = "USBMirror" }
+        item.button?.toolTip = "USBMirror — wired iPhone streaming"
+
+        let quickMenu = NSMenu()
+        let quickControls = NSMenuItem(
+            title: "Show Controls", action: #selector(showControlWindow), keyEquivalent: "")
+        quickControls.target = self
+        quickMenu.addItem(quickControls)
+        let quickOutput = NSMenuItem(
+            title: "Show OBS Output", action: #selector(showOutputWindow), keyEquivalent: "")
+        quickOutput.target = self
+        quickMenu.addItem(quickOutput)
+        quickMenu.addItem(.separator())
+        let quickMute = NSMenuItem(
+            title: "Mute Audio", action: #selector(toggleAudioFromMenu), keyEquivalent: "")
+        quickMute.target = self
+        quickMenu.addItem(quickMute)
+        statusMuteItem = quickMute
+        quickMenu.addItem(.separator())
+        let quickQuit = NSMenuItem(
+            title: "Quit USBMirror", action: #selector(quitUSBMirror), keyEquivalent: "")
+        quickQuit.target = self
+        quickMenu.addItem(quickQuit)
+        item.menu = quickMenu
+        statusItem = item
+    }
+
+    // Closing Controls now hides it. Reopen using the system menu bar icon.
+    func windowWillClose(_ notification: Notification) {}
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        monitoringTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+        if captureSession.isRunning { captureSession.stopRunning() }
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()

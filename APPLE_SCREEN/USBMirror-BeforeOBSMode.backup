@@ -1,0 +1,393 @@
+import AVFoundation
+import AppKit
+import CoreMediaIO
+
+// USBMirror: wired iPhone video + audio preview.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var window: NSWindow!
+    private var statusLabel: NSTextField!
+    private var previewLayer: AVCaptureVideoPreviewLayer!
+    private var volumeSlider: NSSlider!
+    private var volumeValueLabel: NSTextField!
+    private var muteButton: NSButton!
+
+    private let captureSession = AVCaptureSession()
+    private let audioPreview = AVCaptureAudioPreviewOutput()
+    private var isAudioMuted = false
+    private let savedVolumeKey = "USBMirror.savedVolume"
+    private var deviceCheckTimer: Timer?
+    private var lastDetectedDeviceID: String?
+    private var hasPerformedFirstDeviceCheck = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        createWindow()
+        enableIPhoneCaptureDevices()
+        beginDeviceMonitoring()
+    }
+
+    private func createWindow() {
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: 800),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "USBMirror"
+        window.center()
+        window.minSize = NSSize(width: 520, height: 540)
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        window.appearance = NSAppearance(named: .darkAqua)
+
+        let content = NSView()
+        content.wantsLayer = true
+        content.layer?.backgroundColor =
+            NSColor(
+                calibratedRed: 0.07, green: 0.08, blue: 0.10, alpha: 1.0
+            ).cgColor
+        window.contentView = content
+
+        let titleLabel = NSTextField(labelWithString: "USBMirror")
+        titleLabel.font = .boldSystemFont(ofSize: 24)
+        titleLabel.textColor = .white
+
+        statusLabel = NSTextField(labelWithString: "Connect your iPhone via USB")
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .systemGray
+        statusLabel.alignment = .right
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+
+        let fullScreenButton = NSButton(
+            title: "Full Screen", target: self, action: #selector(toggleFullScreenMode)
+        )
+        fullScreenButton.bezelStyle = .rounded
+
+        let previewView = NSView()
+        previewView.wantsLayer = true
+        previewView.layer?.backgroundColor = NSColor.black.cgColor
+        previewView.layer?.cornerRadius = 12
+        previewView.layer?.masksToBounds = true
+        previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+        previewLayer.videoGravity = .resizeAspect
+        previewView.layer?.addSublayer(previewLayer)
+        previewLayer.frame = previewView.bounds
+        previewLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+
+        let startButton = NSButton(
+            title: "Start Mirroring", target: self, action: #selector(startMirroring)
+        )
+        startButton.bezelStyle = .rounded
+        startButton.keyEquivalent = "\r"
+
+        let stopButton = NSButton(
+            title: "Stop Mirroring", target: self, action: #selector(stopMirroring)
+        )
+        stopButton.bezelStyle = .rounded
+
+        let audioLabel = NSTextField(labelWithString: "Audio")
+        audioLabel.font = .boldSystemFont(ofSize: 14)
+        audioLabel.textColor = .white
+
+        let savedVolume =
+            UserDefaults.standard.object(forKey: savedVolumeKey) == nil
+            ? 1.0
+            : min(1.0, max(0.0, UserDefaults.standard.double(forKey: savedVolumeKey)))
+
+        volumeSlider = NSSlider(
+            value: savedVolume, minValue: 0.0, maxValue: 1.0,
+            target: self, action: #selector(volumeChanged(_:))
+        )
+        volumeSlider.isContinuous = true
+
+        volumeValueLabel = NSTextField(
+            labelWithString: "\(Int((savedVolume * 100).rounded()))%"
+        )
+        volumeValueLabel.font = .systemFont(ofSize: 12)
+        volumeValueLabel.textColor = .systemGray
+        volumeValueLabel.alignment = .right
+
+        muteButton = NSButton(
+            title: "Mute Audio", target: self, action: #selector(toggleAudioMute(_:))
+        )
+        muteButton.bezelStyle = .rounded
+
+        let views: [NSView] = [
+            titleLabel, statusLabel, fullScreenButton, previewView,
+            startButton, stopButton, audioLabel, volumeSlider,
+            volumeValueLabel, muteButton,
+        ]
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+
+            fullScreenButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            fullScreenButton.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor, constant: -24),
+            fullScreenButton.widthAnchor.constraint(equalToConstant: 110),
+
+            statusLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            statusLabel.trailingAnchor.constraint(
+                equalTo: fullScreenButton.leadingAnchor, constant: -12),
+            statusLabel.leadingAnchor.constraint(
+                greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
+
+            previewView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 20),
+            previewView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            previewView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+
+            startButton.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 18),
+            startButton.leadingAnchor.constraint(equalTo: previewView.leadingAnchor),
+            startButton.trailingAnchor.constraint(equalTo: content.centerXAnchor, constant: -6),
+            startButton.heightAnchor.constraint(equalToConstant: 36),
+
+            stopButton.topAnchor.constraint(equalTo: startButton.topAnchor),
+            stopButton.leadingAnchor.constraint(equalTo: content.centerXAnchor, constant: 6),
+            stopButton.trailingAnchor.constraint(equalTo: previewView.trailingAnchor),
+            stopButton.heightAnchor.constraint(equalToConstant: 36),
+
+            audioLabel.topAnchor.constraint(equalTo: startButton.bottomAnchor, constant: 22),
+            audioLabel.leadingAnchor.constraint(equalTo: previewView.leadingAnchor),
+
+            volumeSlider.centerYAnchor.constraint(equalTo: audioLabel.centerYAnchor),
+            volumeSlider.leadingAnchor.constraint(equalTo: audioLabel.trailingAnchor, constant: 18),
+            volumeSlider.trailingAnchor.constraint(
+                equalTo: volumeValueLabel.leadingAnchor, constant: -12),
+
+            volumeValueLabel.centerYAnchor.constraint(equalTo: audioLabel.centerYAnchor),
+            volumeValueLabel.trailingAnchor.constraint(equalTo: previewView.trailingAnchor),
+            volumeValueLabel.widthAnchor.constraint(equalToConstant: 48),
+
+            muteButton.topAnchor.constraint(equalTo: audioLabel.bottomAnchor, constant: 16),
+            muteButton.trailingAnchor.constraint(equalTo: previewView.trailingAnchor),
+            muteButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            muteButton.heightAnchor.constraint(equalToConstant: 32),
+        ])
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func enableIPhoneCaptureDevices() {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+        )
+        var enabled: UInt32 = 1
+        let result = CMIOObjectSetPropertyData(
+            CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil,
+            UInt32(MemoryLayout<UInt32>.size), &enabled
+        )
+        if result == noErr {
+            print("USB screen capture devices enabled.")
+        } else {
+            statusLabel.stringValue = "USB capture setup failed: \(result)"
+        }
+    }
+
+    // MARK: - Automatic USB Device Status (no automatic capture)
+
+    private func beginDeviceMonitoring() {
+        checkConnectedIPhone()
+        // This timer runs on the main RunLoop and only checks device presence.
+        deviceCheckTimer = Timer.scheduledTimer(
+            timeInterval: 2.0,
+            target: self,
+            selector: #selector(pollDevices(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+    }
+
+    @objc private func pollDevices(_ timer: Timer) {
+        checkConnectedIPhone()
+    }
+
+    private func checkConnectedIPhone() {
+        // Do not interfere with an active audio/video capture session.
+        if captureSession.isRunning { return }
+
+        let devices = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.externalUnknown],
+            mediaType: nil,
+            position: .unspecified
+        ).devices
+
+        // Select the screen-mirroring source, not "iPhone Camera".
+        let iphone =
+            devices.first(where: {
+                $0.modelID == "iOS Device" && $0.hasMediaType(.muxed)
+            })
+            ?? devices.first(where: {
+                ($0.localizedName.localizedCaseInsensitiveContains("iPhone")
+                    || $0.localizedName.localizedCaseInsensitiveContains("iPad"))
+                    && $0.hasMediaType(.muxed)
+            })
+
+        let newID = iphone?.uniqueID
+        if !hasPerformedFirstDeviceCheck || newID != lastDetectedDeviceID {
+            hasPerformedFirstDeviceCheck = true
+            lastDetectedDeviceID = newID
+            if let iphone {
+                statusLabel.stringValue = "Ready: \(iphone.localizedName)"
+                print("USB iPhone detected:", iphone.localizedName)
+            } else {
+                statusLabel.stringValue = "Connect and unlock your iPhone via USB"
+                print("No USB iPhone screen-capture device connected.")
+            }
+        }
+    }
+
+    @objc private func startMirroring() {
+        statusLabel.stringValue = "Checking capture permission..."
+        Task { @MainActor in
+            let allowed = await AVCaptureDevice.requestAccess(for: .video)
+            if allowed {
+                configureAndStartCapture()
+            } else {
+                statusLabel.stringValue = "Camera access denied in System Settings"
+            }
+        }
+    }
+
+    private func configureAndStartCapture() {
+        if captureSession.isRunning {
+            statusLabel.stringValue = "Already mirroring"
+            return
+        }
+        statusLabel.stringValue = "Searching for iPhone..."
+
+        // .externalUnknown remains compatible with our project's macOS 12 target.
+        // nil avoids filtering out the iPhone's muxed screen-capture device.
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.externalUnknown], mediaType: nil, position: .unspecified
+        )
+        print("Searching capture devices...")
+        for device in discovery.devices {
+            print(
+                "Name:", device.localizedName,
+                "Model:", device.modelID,
+                "Muxed:", device.hasMediaType(.muxed))
+        }
+
+        // Prefer the screen-capture device, not the separate iPhone Camera device.
+        guard
+            let iphone = discovery.devices.first(where: {
+                $0.modelID == "iOS Device" && $0.hasMediaType(.muxed)
+            })
+                ?? discovery.devices.first(where: {
+                    ($0.localizedName.localizedCaseInsensitiveContains("iPhone")
+                        || $0.localizedName.localizedCaseInsensitiveContains("iPad"))
+                        && $0.hasMediaType(.muxed)
+                })
+        else {
+            statusLabel.stringValue = "No iPhone screen capture device found"
+            return
+        }
+
+        print("Selected iPhone:", iphone.localizedName)
+        do {
+            let input = try AVCaptureDeviceInput(device: iphone)
+            captureSession.beginConfiguration()
+            for oldInput in captureSession.inputs {
+                captureSession.removeInput(oldInput)
+            }
+            guard captureSession.canAddInput(input) else {
+                captureSession.commitConfiguration()
+                statusLabel.stringValue = "Cannot use iPhone capture device"
+                return
+            }
+            captureSession.addInput(input)
+            print("iPhone capture input added.")
+            for port in input.ports {
+                print("Input port:", port.mediaType.rawValue)
+            }
+
+            if !captureSession.outputs.contains(audioPreview) {
+                if captureSession.canAddOutput(audioPreview) {
+                    captureSession.addOutput(audioPreview)
+                    print("Audio preview output added.")
+                } else {
+                    print("Cannot add audio preview output.")
+                }
+            }
+            audioPreview.volume = isAudioMuted ? 0 : Float(volumeSlider.doubleValue)
+            captureSession.commitConfiguration()
+
+            if let connection = audioPreview.connection(with: .audio) {
+                print("Audio connection found. Enabled:", connection.isEnabled)
+            } else {
+                print("No audio connection in capture session.")
+            }
+
+            // Prototype behavior: the session starts on the main thread.
+            // We can move it to a dedicated capture queue after this UI test.
+            captureSession.startRunning()
+            if captureSession.isRunning {
+                statusLabel.stringValue = "Mirroring: \(iphone.localizedName)"
+                print("Video capture session running.")
+            } else {
+                statusLabel.stringValue = "Unable to start capture"
+            }
+        } catch {
+            statusLabel.stringValue = "Error: \(error.localizedDescription)"
+            print("Capture error:", error.localizedDescription)
+        }
+    }
+
+    @objc private func toggleAudioMute(_ sender: NSButton) {
+        isAudioMuted.toggle()
+        audioPreview.volume = isAudioMuted ? 0 : Float(volumeSlider.doubleValue)
+        muteButton.title = isAudioMuted ? "Unmute Audio" : "Mute Audio"
+        print(isAudioMuted ? "Audio muted." : "Audio unmuted.")
+    }
+
+    @objc private func volumeChanged(_ sender: NSSlider) {
+        isAudioMuted = false
+        muteButton.title = "Mute Audio"
+        audioPreview.volume = Float(sender.doubleValue)
+        UserDefaults.standard.set(sender.doubleValue, forKey: savedVolumeKey)
+        let percentage = Int((sender.doubleValue * 100).rounded())
+        volumeValueLabel.stringValue = "\(percentage)%"
+        print("Volume:", percentage, "%")
+    }
+
+    @objc private func toggleFullScreenMode() {
+        window.toggleFullScreen(nil)
+    }
+
+    @objc private func stopMirroring() {
+        if captureSession.isRunning {
+            captureSession.stopRunning()
+            print("Capture session stopped.")
+        }
+        statusLabel.stringValue = "Mirroring stopped"
+        // Refresh connection status after an intentional stop.
+        hasPerformedFirstDeviceCheck = false
+        checkConnectedIPhone()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        deviceCheckTimer?.invalidate()
+        deviceCheckTimer = nil
+        if captureSession.isRunning {
+            captureSession.stopRunning()
+        }
+        print("USBMirror closed.")
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()

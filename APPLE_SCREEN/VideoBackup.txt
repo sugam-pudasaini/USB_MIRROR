@@ -1,0 +1,278 @@
+import AVFoundation
+import AppKit
+import CoreMediaIO
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    var window: NSWindow!
+    var statusLabel: NSTextField!
+    var previewLayer: AVCaptureVideoPreviewLayer!
+
+    let captureSession = AVCaptureSession()
+
+    func applicationDidFinishLaunching(
+        _ notification: Notification
+    ) {
+        createWindow()
+        enableIPhoneCaptureDevices()
+    }
+
+    func createWindow() {
+        window = NSWindow(
+            contentRect: NSRect(
+                x: 0, y: 0,
+                width: 550, height: 750
+            ),
+            styleMask: [
+                .titled,
+                .closable,
+                .miniaturizable,
+                .resizable,
+            ],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.title = "USBMirror"
+        window.center()
+
+        let content = NSView(
+            frame: NSRect(
+                x: 0, y: 0, width: 550, height: 750
+            ))
+        window.contentView = content
+
+        // Live video preview area
+        let previewView = NSView()
+        previewView.wantsLayer = true
+        previewView.layer?.backgroundColor =
+            NSColor.black.cgColor
+
+        previewView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(previewView)
+
+        NSLayoutConstraint.activate([
+            previewView.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor,
+                constant: 15
+            ),
+            previewView.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor,
+                constant: -15
+            ),
+            previewView.topAnchor.constraint(
+                equalTo: content.topAnchor,
+                constant: 15
+            ),
+            previewView.bottomAnchor.constraint(
+                equalTo: content.bottomAnchor,
+                constant: -100
+            ),
+        ])
+
+        previewLayer = AVCaptureVideoPreviewLayer(
+            session: captureSession
+        )
+        previewLayer.videoGravity = .resizeAspect
+
+        previewView.layer?.addSublayer(previewLayer)
+
+        // Automatically resize the video layer
+        let bounds = previewView.bounds
+        previewLayer.frame = bounds
+        previewLayer.autoresizingMask = [
+            .layerWidthSizable,
+            .layerHeightSizable,
+        ]
+
+        // Status text
+        statusLabel = NSTextField(
+            labelWithString: "Connect your iPhone via USB"
+        )
+        statusLabel.frame = NSRect(
+            x: 20, y: 60,
+            width: 510, height: 25
+        )
+        statusLabel.alignment = .center
+        statusLabel.autoresizingMask = [.width]
+
+        content.addSubview(statusLabel)
+
+        // Start mirroring button
+        let startButton = NSButton(
+            title: "Start Mirroring",
+            target: self,
+            action: #selector(startMirroring)
+        )
+        startButton.frame = NSRect(
+            x: 95, y: 15,
+            width: 170, height: 35
+        )
+        content.addSubview(startButton)
+
+        // Stop mirroring button
+        let stopButton = NSButton(
+            title: "Stop Mirroring",
+            target: self,
+            action: #selector(stopMirroring)
+        )
+        stopButton.frame = NSRect(
+            x: 285, y: 15,
+            width: 170, height: 35
+        )
+        content.addSubview(stopButton)
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func enableIPhoneCaptureDevices() {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(
+                kCMIOHardwarePropertyAllowScreenCaptureDevices
+            ),
+            mScope: CMIOObjectPropertyScope(
+                kCMIOObjectPropertyScopeGlobal
+            ),
+            mElement: CMIOObjectPropertyElement(
+                kCMIOObjectPropertyElementMain
+            )
+        )
+
+        var enabled: UInt32 = 1
+
+        let result = CMIOObjectSetPropertyData(
+            CMIOObjectID(kCMIOObjectSystemObject),
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &enabled
+        )
+
+        if result != noErr {
+            statusLabel.stringValue =
+                "USB capture setup failed: \(result)"
+        }
+    }
+
+    @objc func startMirroring() {
+        statusLabel.stringValue =
+            "Checking capture permission..."
+
+        Task { @MainActor in
+            let allowed = await AVCaptureDevice.requestAccess(
+                for: .video
+            )
+
+            if allowed {
+                self.configureAndStartCapture()
+            } else {
+                self.statusLabel.stringValue =
+                    "Camera access denied in System Settings"
+            }
+        }
+    }
+
+    func configureAndStartCapture() {
+        if captureSession.isRunning {
+            statusLabel.stringValue =
+                "Already mirroring"
+            return
+        }
+
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.externalUnknown],
+            mediaType: .muxed,
+            position: .unspecified
+        )
+
+        print("Capture devices:")
+        for device in discovery.devices {
+            print(device.localizedName, device.modelID)
+        }
+
+        guard
+            let iphone = discovery.devices.first(where: {
+                $0.localizedName.localizedCaseInsensitiveContains(
+                    "iPhone"
+                )
+                    || $0.localizedName.localizedCaseInsensitiveContains(
+                        "iPad"
+                    ) || $0.modelID == "iOS Device"
+            })
+        else {
+            statusLabel.stringValue =
+                "No iPhone capture device found"
+            return
+        }
+
+        do {
+            let input = try AVCaptureDeviceInput(
+                device: iphone
+            )
+
+            captureSession.beginConfiguration()
+
+            for oldInput in captureSession.inputs {
+                captureSession.removeInput(oldInput)
+            }
+
+            guard captureSession.canAddInput(input) else {
+                captureSession.commitConfiguration()
+                statusLabel.stringValue =
+                    "Cannot use this capture device"
+                return
+            }
+
+            captureSession.addInput(input)
+            captureSession.commitConfiguration()
+
+            // Simple prototype. Later we'll move
+            // session startup to a background queue.
+            captureSession.startRunning()
+
+            if captureSession.isRunning {
+                statusLabel.stringValue =
+                    "Mirroring: \(iphone.localizedName)"
+            } else {
+                statusLabel.stringValue =
+                    "Unable to start capture"
+            }
+
+        } catch {
+            statusLabel.stringValue =
+                "Error: \(error.localizedDescription)"
+        }
+    }
+
+    @objc func stopMirroring() {
+        if captureSession.isRunning {
+            captureSession.stopRunning()
+        }
+
+        statusLabel.stringValue = "Mirroring stopped"
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        true
+    }
+
+    func applicationWillTerminate(
+        _ notification: Notification
+    ) {
+        if captureSession.isRunning {
+            captureSession.stopRunning()
+        }
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()

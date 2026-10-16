@@ -1,0 +1,162 @@
+import AVFoundation
+import AppKit
+import CoreMediaIO
+
+@MainActor
+class AppDelegate: NSObject, NSApplicationDelegate {
+
+    var window: NSWindow!
+    var statusLabel: NSTextField!
+
+    func applicationDidFinishLaunching(
+        _ notification: Notification
+    ) {
+        // Create our Mac window
+        window = NSWindow(
+            contentRect: NSRect(
+                x: 0, y: 0,
+                width: 600, height: 450
+            ),
+            styleMask: [
+                .titled,
+                .closable,
+                .miniaturizable,
+                .resizable,
+            ],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.title = "USBMirror"
+        window.center()
+
+        // Application heading
+        let heading = NSTextField(
+            labelWithString: "USBMirror"
+        )
+        heading.font = .boldSystemFont(ofSize: 28)
+        heading.alignment = .center
+        heading.frame = NSRect(
+            x: 100, y: 310,
+            width: 400, height: 50
+        )
+
+        window.contentView?.addSubview(heading)
+
+        // Connection status
+        statusLabel = NSTextField(
+            labelWithString: "Connect your iPhone via USB"
+        )
+        statusLabel.alignment = .center
+        statusLabel.frame = NSRect(
+            x: 50, y: 230,
+            width: 500, height: 40
+        )
+
+        window.contentView?.addSubview(statusLabel)
+
+        // Detection button
+        let button = NSButton(
+            title: "Detect iPhone",
+            target: self,
+            action: #selector(detectIPhone)
+        )
+        button.frame = NSRect(
+            x: 200, y: 160,
+            width: 200, height: 45
+        )
+
+        window.contentView?.addSubview(button)
+
+        // Show window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func detectIPhone() {
+
+        statusLabel.stringValue = "Searching..."
+
+        // Enable USB iPhone screen capture devices
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(
+                kCMIOHardwarePropertyAllowScreenCaptureDevices
+            ),
+            mScope: CMIOObjectPropertyScope(
+                kCMIOObjectPropertyScopeGlobal
+            ),
+            mElement: CMIOObjectPropertyElement(
+                kCMIOObjectPropertyElementMain
+            )
+        )
+
+        var enabled: UInt32 = 1
+
+        let result = CMIOObjectSetPropertyData(
+            CMIOObjectID(kCMIOObjectSystemObject),
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &enabled
+        )
+
+        guard result == noErr else {
+            statusLabel.stringValue =
+                "Capture setup failed: \(result)"
+            return
+        }
+
+        // Give macOS time to update its device list
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 1.0
+        ) {
+            let discovery =
+                AVCaptureDevice.DiscoverySession(
+                    deviceTypes: [.externalUnknown],
+                    mediaType: .muxed,
+                    position: .unspecified
+                )
+
+            let devices = discovery.devices
+
+            // Print all available device names
+            for device in devices {
+                print("Found device: \(device.localizedName)")
+                print("Model: \(device.modelID)")
+            }
+
+            // Find a connected iOS device
+            if let iphone = devices.first(where: {
+                $0.localizedName.localizedCaseInsensitiveContains(
+                    "iPhone"
+                )
+                    || $0.localizedName.localizedCaseInsensitiveContains(
+                        "iPad"
+                    ) || $0.modelID == "iOS Device"
+            }) {
+                self.statusLabel.stringValue =
+                    "Connected: \(iphone.localizedName)"
+
+                print("iPhone detected successfully!")
+            } else {
+                self.statusLabel.stringValue =
+                    "No iPhone capture device found"
+            }
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        true
+    }
+}
+
+// Launch USBMirror
+let app = NSApplication.shared
+let delegate = AppDelegate()
+
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()
